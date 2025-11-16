@@ -9,12 +9,15 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 const server = http.createServer(app);
+app.use(cors());
+
 const io = socketio(server, {
   cors: {
-    origin: "http://localhost:3000",
+    origin: "*", // For now, allow all origins
     methods: ["GET", "POST"]
   }
 });
+
 
 app.use(cors());
 app.use(express.json());
