@@ -9,11 +9,19 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 const server = http.createServer(app);
-app.use(cors());
+app.use(cors({
+  origin: [
+    "http://localhost:3000",
+    "https://video-conference-frontend-xyz.vercel.app"  // Add your Vercel URL
+  ]
+}));
 
 const io = socketio(server, {
   cors: {
-    origin: "*", // For now, allow all origins
+    origin: [
+      "http://localhost:3000",
+      "https://video-conference-frontend-xyz.vercel.app"  // Add your Vercel URL
+    ],
     methods: ["GET", "POST"]
   }
 });
