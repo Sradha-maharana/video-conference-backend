@@ -12,7 +12,7 @@ const server = http.createServer(app);
 app.use(cors({
   origin: [
     "http://localhost:3000",
-    "https://video-conference-frontend.vercel.app"  // ← Add your Vercel URL
+    "https://video-conference-frontend.vercel.app"  // Your Vercel URL
   ]
 }));
 
@@ -20,12 +20,11 @@ const io = socketio(server, {
   cors: {
     origin: [
       "http://localhost:3000",
-      "https://video-conference-frontend.vercel.app"  // ← Add your Vercel URL
+      "https://video-conference-frontend.vercel.app"  // Your Vercel URL
     ],
     methods: ["GET", "POST"]
   }
 });
-
 
 app.use(cors());
 app.use(express.json());
