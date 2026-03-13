@@ -6,28 +6,32 @@ const http = require('http');
 const socketio = require('socket.io');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const server = http.createServer(app);
-app.use(cors({
-  origin: [
-    "http://localhost:3000",
-    "https://video-conference-frontend.vercel.app"  // Your Vercel URL
-  ]
-}));
 
 const io = socketio(server, {
   cors: {
     origin: [
       "http://localhost:3000",
-      "https://video-conference-frontend.vercel.app"  // Your Vercel URL
+      "https://video-conference-frontend.vercel.app/"  // URL
     ],
     methods: ["GET", "POST"]
   }
 });
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    "http://localhost:3000",
+    "https://video-conference-frontend.vercel.app"  // URL
+  ]
+}));
+
 app.use(express.json());
+
+// ✅ Health check endpoint (keeps Render.com instance alive)
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // MongoDB Connection
 mongoose.connect(process.env.MONGODB_URI)
@@ -52,17 +56,56 @@ const roomSchema = new mongoose.Schema({
 });
 const Room = mongoose.model('Room', roomSchema);
 
+// ✅ JWT Auth Middleware
+const verifyToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
+
+  if (!token) {
+    return res.status(401).json({ message: 'Access denied. No token provided.' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded; // { userId: '...' }
+    next();
+  } catch (error) {
+    return res.status(401).json({ message: 'Invalid or expired token.' });
+  }
+};
+
+// ✅ Rate limiting — prevent brute force on auth routes
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  message: { message: 'Too many attempts. Please try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
 // Register Route
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { name, email, password } = req.body;
+
+    // ✅ Server-side input validation
+    if (!name || name.trim().length < 2) {
+      return res.status(400).json({ message: 'Name must be at least 2 characters.' });
+    }
+    if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+      return res.status(400).json({ message: 'Please provide a valid email address.' });
+    }
+    if (!password || password.length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+    }
+
     let user = await User.findOne({ email });
-    if (user) return res.status(400).json({ message: 'User exists' });
+    if (user) return res.status(400).json({ message: 'An account with this email already exists.' });
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    user = new User({ name, email, password: hashedPassword });
+    user = new User({ name: name.trim(), email: email.toLowerCase(), password: hashedPassword });
     await user.save();
 
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
@@ -73,10 +116,16 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 // Login Route
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email });
+
+    // ✅ Server-side input validation
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email and password are required.' });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(400).json({ message: 'Invalid credentials' });
 
     const isMatch = await bcrypt.compare(password, user.password);
@@ -89,10 +138,11 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Create Room
-app.post('/api/rooms/create', async (req, res) => {
+// Create Room — protected
+app.post('/api/rooms/create', verifyToken, async (req, res) => {
   try {
-    const { userId } = req.body;
+    // ✅ userId from verified token, not req.body
+    const userId = req.user.userId;
     const roomId = Math.random().toString(36).substring(2, 10).toUpperCase();
     const room = new Room({ roomId, host: userId, participants: [userId] });
     await room.save();
@@ -102,8 +152,8 @@ app.post('/api/rooms/create', async (req, res) => {
   }
 });
 
-// Get Room
-app.get('/api/rooms/:roomId', async (req, res) => {
+// Get Room — protected
+app.get('/api/rooms/:roomId', verifyToken, async (req, res) => {
   try {
     const room = await Room.findOne({ roomId: req.params.roomId });
     if (!room) return res.status(404).json({ message: 'Room not found' });
@@ -113,40 +163,156 @@ app.get('/api/rooms/:roomId', async (req, res) => {
   }
 });
 
-// Socket.IO
+// Socket.IO - WebRTC Signaling
 const rooms = {};
+// waiting: { [roomId]: [{ socketId, userId, userName }] }
+const waiting = {};
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
   socket.on('join-room', ({ roomId, userId, userName }) => {
-    socket.join(roomId);
-    if (!rooms[roomId]) rooms[roomId] = { users: [], messages: [] };
-    rooms[roomId].users.push({ socketId: socket.id, userId, userName });
-    socket.to(roomId).emit('user-connected', { userId, userName, socketId: socket.id });
-    const existingUsers = rooms[roomId].users.filter(u => u.socketId !== socket.id);
-    socket.emit('existing-users', existingUsers);
-    socket.emit('chat-history', rooms[roomId].messages);
+    if (!rooms[roomId]) {
+      // First person = host, let them in immediately
+      rooms[roomId] = { users: [], messages: [], hostSocketId: socket.id };
+      waiting[roomId] = [];
+
+      socket.join(roomId);
+      rooms[roomId].users.push({ socketId: socket.id, userId, userName });
+      socket.emit('existing-users', []);
+      socket.emit('chat-history', []);
+      socket.emit('join-approved');
+      console.log(`Host ${userName} created room ${roomId}`);
+    } else {
+      // Room exists — put new user in waiting room, notify host
+      if (!waiting[roomId]) waiting[roomId] = [];
+      waiting[roomId].push({ socketId: socket.id, userId, userName });
+
+      // Tell the joiner they are waiting
+      socket.emit('waiting-for-approval');
+
+      // Notify host to admit/deny
+      const hostSocketId = rooms[roomId].hostSocketId;
+      io.to(hostSocketId).emit('admission-request', {
+        socketId: socket.id,
+        userName,
+        userId
+      });
+      console.log(`${userName} is waiting to join ${roomId}`);
+    }
   });
 
-  socket.on('signal', ({ to, signal, from }) => {
-    io.to(to).emit('signal', { signal, from });
+  // Host admits a waiting user
+  socket.on('admit-user', ({ roomId, socketId }) => {
+    const waitingList = waiting[roomId] || [];
+    const user = waitingList.find(u => u.socketId === socketId);
+    if (!user) return;
+
+    // Remove from waiting list
+    waiting[roomId] = waitingList.filter(u => u.socketId !== socketId);
+
+    const admittedSocket = io.sockets.sockets.get(socketId);
+    if (!admittedSocket) return;
+
+    admittedSocket.join(roomId);
+
+    const existingUsers = [...rooms[roomId].users];
+    rooms[roomId].users.push({ socketId, userId: user.userId, userName: user.userName });
+
+    // Tell admitted user they're in
+    admittedSocket.emit('join-approved');
+    admittedSocket.emit('existing-users', existingUsers);
+    admittedSocket.emit('chat-history', rooms[roomId].messages);
+
+    console.log(`${user.userName} admitted to ${roomId}`);
   });
 
+  // Host denies a waiting user
+  socket.on('deny-user', ({ roomId, socketId }) => {
+    const waitingList = waiting[roomId] || [];
+    waiting[roomId] = waitingList.filter(u => u.socketId !== socketId);
+
+    io.to(socketId).emit('join-denied');
+    console.log(`User ${socketId} denied from ${roomId}`);
+  });
+
+  // Initiator (new joiner) sends signal to each existing peer
+  socket.on('sending-signal', ({ userToSignal, callerID, signal }) => {
+    const room = Object.keys(rooms).find(roomId =>
+      rooms[roomId].users.some(u => u.socketId === callerID)
+    );
+
+    if (room) {
+      // ✅ Fixed: send CALLER's info, not the target's
+      const caller = rooms[room].users.find(u => u.socketId === callerID);
+      io.to(userToSignal).emit('user-connected', {
+        signal,
+        socketId: callerID,
+        userId: caller?.userId,
+        userName: caller?.userName
+      });
+    }
+  });
+
+  // Existing peer responds to initiator
+  socket.on('returning-signal', ({ callerID, signal }) => {
+    io.to(callerID).emit('receiving-returned-signal', {
+      signal,
+      id: socket.id
+    });
+  });
+
+  // Chat messages
   socket.on('send-message', ({ roomId, message, userName }) => {
     const msg = { userName, message, timestamp: new Date().toISOString() };
-    if (rooms[roomId]) rooms[roomId].messages.push(msg);
-    io.to(roomId).emit('new-message', msg);
+    if (rooms[roomId]) {
+      rooms[roomId].messages.push(msg);
+    }
+    // ✅ Fixed: broadcast to others only — sender adds message locally
+    socket.to(roomId).emit('new-message', msg);
   });
 
+  // Disconnect
   socket.on('disconnect', () => {
-    Object.keys(rooms).forEach(roomId => {
+    console.log('User disconnected:', socket.id);
+
+    // Remove from any waiting lists
+    Object.keys(waiting).forEach(roomId => {
+      if (waiting[roomId]) {
+        waiting[roomId] = waiting[roomId].filter(u => u.socketId !== socket.id);
+      }
+    });
+
+    Object.keys(rooms).forEach(async (roomId) => {
       if (rooms[roomId]) {
         const userIndex = rooms[roomId].users.findIndex(u => u.socketId === socket.id);
         if (userIndex !== -1) {
           const user = rooms[roomId].users[userIndex];
           rooms[roomId].users.splice(userIndex, 1);
-          socket.to(roomId).emit('user-disconnected', { socketId: socket.id, userName: user.userName });
+
+          socket.to(roomId).emit('user-disconnected', {
+            socketId: socket.id,
+            userName: user.userName
+          });
+
+          // If host left, assign new host or clean up
+          if (rooms[roomId].hostSocketId === socket.id) {
+            if (rooms[roomId].users.length > 0) {
+              rooms[roomId].hostSocketId = rooms[roomId].users[0].socketId;
+              io.to(rooms[roomId].hostSocketId).emit('you-are-host');
+            }
+          }
+
+          // Clean up empty rooms
+          if (rooms[roomId].users.length === 0) {
+            delete rooms[roomId];
+            delete waiting[roomId];
+            try {
+              await Room.deleteOne({ roomId });
+            } catch (err) {
+              console.error('Error cleaning up room from DB:', err);
+            }
+          }
         }
       }
     });
