@@ -15,7 +15,8 @@ const io = socketio(server, {
   cors: {
     origin: [
       "http://localhost:3000",
-      "https://video-conference-frontend.vercel.app/"  // URL
+      "https://video-conference-frontend-5s1ap5d6q-srads-projects-f48fb9a3.vercel.app",
+      "https://video-conference-frontend-3zm74bq6l-srads-projects-f48fb9a3.vercel.app"
     ],
     methods: ["GET", "POST"]
   }
@@ -24,7 +25,8 @@ const io = socketio(server, {
 app.use(cors({
   origin: [
     "http://localhost:3000",
-    "https://video-conference-frontend.vercel.app"  // URL
+    "https://video-conference-frontend-5s1ap5d6q-srads-projects-f48fb9a3.vercel.app",
+    "https://video-conference-frontend-3zm74bq6l-srads-projects-f48fb9a3.vercel.app"
   ]
 }));
 
