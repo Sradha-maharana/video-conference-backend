@@ -14,31 +14,28 @@ const server = http.createServer(app);
 const io = socketio(server, {
   cors: {
     origin: [
-  "http://localhost:3000",
-  "https://video-conference-frontend.vercel.app"
-],
+      "http://localhost:3000",
+      "https://video-conference-frontend.vercel.app"
+    ],
     methods: ["GET", "POST"]
   }
 });
 
 app.use(cors({
   origin: [
-  "http://localhost:3000",
-  "https://video-conference-frontend.vercel.app"
-]
+    "http://localhost:3000",
+    "https://video-conference-frontend.vercel.app"
+  ]
 }));
 
 app.use(express.json());
 
-// ✅ Health check endpoint (keeps Render.com instance alive)
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// MongoDB Connection
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ MongoDB Connected'))
   .catch(err => console.log('❌ MongoDB Error:', err));
 
-// User Schema
 const userSchema = new mongoose.Schema({
   name: String,
   email: { type: String, unique: true },
@@ -47,7 +44,6 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 
-// Room Schema
 const roomSchema = new mongoose.Schema({
   roomId: String,
   host: String,
@@ -56,55 +52,42 @@ const roomSchema = new mongoose.Schema({
 });
 const Room = mongoose.model('Room', roomSchema);
 
-// ✅ JWT Auth Middleware
 const verifyToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
-
-  if (!token) {
-    return res.status(401).json({ message: 'Access denied. No token provided.' });
-  }
-
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'Access denied. No token provided.' });
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded; // { userId: '...' }
+    req.user = decoded;
     next();
   } catch (error) {
     return res.status(401).json({ message: 'Invalid or expired token.' });
   }
 };
 
-// ✅ Rate limiting — prevent brute force on auth routes
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 20,
   message: { message: 'Too many attempts. Please try again in 15 minutes.' },
   standardHeaders: true,
   legacyHeaders: false
 });
 
-// Register Route
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { name, email, password } = req.body;
-
-    // ✅ Server-side input validation
-    if (!name || name.trim().length < 2) {
+    if (!name || name.trim().length < 2)
       return res.status(400).json({ message: 'Name must be at least 2 characters.' });
-    }
-    if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+    if (!email || !/^\S+@\S+\.\S+$/.test(email))
       return res.status(400).json({ message: 'Please provide a valid email address.' });
-    }
-    if (!password || password.length < 6) {
+    if (!password || password.length < 6)
       return res.status(400).json({ message: 'Password must be at least 6 characters.' });
-    }
 
     let user = await User.findOne({ email });
     if (user) return res.status(400).json({ message: 'An account with this email already exists.' });
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-
     user = new User({ name: name.trim(), email: email.toLowerCase(), password: hashedPassword });
     await user.save();
 
@@ -115,15 +98,11 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   }
 });
 
-// Login Route
 app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-
-    // ✅ Server-side input validation
-    if (!email || !password) {
+    if (!email || !password)
       return res.status(400).json({ message: 'Email and password are required.' });
-    }
 
     const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(400).json({ message: 'Invalid credentials' });
@@ -138,10 +117,8 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
 });
 
-// Create Room — protected
 app.post('/api/rooms/create', verifyToken, async (req, res) => {
   try {
-    // ✅ userId from verified token, not req.body
     const userId = req.user.userId;
     const roomId = Math.random().toString(36).substring(2, 10).toUpperCase();
     const room = new Room({ roomId, host: userId, participants: [userId] });
@@ -152,7 +129,6 @@ app.post('/api/rooms/create', verifyToken, async (req, res) => {
   }
 });
 
-// Get Room — protected
 app.get('/api/rooms/:roomId', verifyToken, async (req, res) => {
   try {
     const room = await Room.findOne({ roomId: req.params.roomId });
@@ -163,9 +139,9 @@ app.get('/api/rooms/:roomId', verifyToken, async (req, res) => {
   }
 });
 
-// Socket.IO - WebRTC Signaling
+// Track which room each socket is in: socketId -> roomId
+const socketRoomMap = {};
 const rooms = {};
-// waiting: { [roomId]: [{ socketId, userId, userName }] }
 const waiting = {};
 
 io.on('connection', (socket) => {
@@ -173,42 +149,35 @@ io.on('connection', (socket) => {
 
   socket.on('join-room', ({ roomId, userId, userName }) => {
     if (!rooms[roomId]) {
-      // First person = host, let them in immediately
+      // First person = host
       rooms[roomId] = { users: [], messages: [], hostSocketId: socket.id };
       waiting[roomId] = [];
 
       socket.join(roomId);
       rooms[roomId].users.push({ socketId: socket.id, userId, userName });
+      socketRoomMap[socket.id] = roomId;
+
+      socket.emit('join-approved');
       socket.emit('existing-users', []);
       socket.emit('chat-history', []);
-      socket.emit('join-approved');
       console.log(`Host ${userName} created room ${roomId}`);
     } else {
-      // Room exists — put new user in waiting room, notify host
+      // Put in waiting room
       if (!waiting[roomId]) waiting[roomId] = [];
       waiting[roomId].push({ socketId: socket.id, userId, userName });
-
-      // Tell the joiner they are waiting
       socket.emit('waiting-for-approval');
 
-      // Notify host to admit/deny
       const hostSocketId = rooms[roomId].hostSocketId;
-      io.to(hostSocketId).emit('admission-request', {
-        socketId: socket.id,
-        userName,
-        userId
-      });
-      console.log(`${userName} is waiting to join ${roomId}`);
+      io.to(hostSocketId).emit('admission-request', { socketId: socket.id, userName, userId });
+      console.log(`${userName} waiting to join ${roomId}`);
     }
   });
 
-  // Host admits a waiting user
   socket.on('admit-user', ({ roomId, socketId }) => {
     const waitingList = waiting[roomId] || [];
     const user = waitingList.find(u => u.socketId === socketId);
     if (!user) return;
 
-    // Remove from waiting list
     waiting[roomId] = waitingList.filter(u => u.socketId !== socketId);
 
     const admittedSocket = io.sockets.sockets.get(socketId);
@@ -216,10 +185,18 @@ io.on('connection', (socket) => {
 
     admittedSocket.join(roomId);
 
-    const existingUsers = [...rooms[roomId].users];
-    rooms[roomId].users.push({ socketId, userId: user.userId, userName: user.userName });
+    // ✅ FIX: Send existing users BEFORE adding new user to the list
+    // This prevents the new user from trying to connect to themselves
+    const existingUsers = rooms[roomId].users.map(u => ({
+      socketId: u.socketId,
+      userId: u.userId,
+      userName: u.userName
+    }));
 
-    // Tell admitted user they're in
+    // NOW add the new user to the room
+    rooms[roomId].users.push({ socketId, userId: user.userId, userName: user.userName });
+    socketRoomMap[socketId] = roomId;
+
     admittedSocket.emit('join-approved');
     admittedSocket.emit('existing-users', existingUsers);
     admittedSocket.emit('chat-history', rooms[roomId].messages);
@@ -227,34 +204,25 @@ io.on('connection', (socket) => {
     console.log(`${user.userName} admitted to ${roomId}`);
   });
 
-  // Host denies a waiting user
   socket.on('deny-user', ({ roomId, socketId }) => {
-    const waitingList = waiting[roomId] || [];
-    waiting[roomId] = waitingList.filter(u => u.socketId !== socketId);
-
+    waiting[roomId] = (waiting[roomId] || []).filter(u => u.socketId !== socketId);
     io.to(socketId).emit('join-denied');
-    console.log(`User ${socketId} denied from ${roomId}`);
   });
 
-  // Initiator (new joiner) sends signal to each existing peer
+  // ✅ FIX: Use socketRoomMap to find room reliably
   socket.on('sending-signal', ({ userToSignal, callerID, signal }) => {
-    const room = Object.keys(rooms).find(roomId =>
-      rooms[roomId].users.some(u => u.socketId === callerID)
-    );
+    const roomId = socketRoomMap[callerID];
+    if (!roomId || !rooms[roomId]) return;
 
-    if (room) {
-      // ✅ Fixed: send CALLER's info, not the target's
-      const caller = rooms[room].users.find(u => u.socketId === callerID);
-      io.to(userToSignal).emit('user-connected', {
-        signal,
-        socketId: callerID,
-        userId: caller?.userId,
-        userName: caller?.userName
-      });
-    }
+    const caller = rooms[roomId].users.find(u => u.socketId === callerID);
+    io.to(userToSignal).emit('user-connected', {
+      signal,
+      socketId: callerID,
+      userId: caller?.userId,
+      userName: caller?.userName
+    });
   });
 
-  // Existing peer responds to initiator
   socket.on('returning-signal', ({ callerID, signal }) => {
     io.to(callerID).emit('receiving-returned-signal', {
       signal,
@@ -262,60 +230,55 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Chat messages
   socket.on('send-message', ({ roomId, message, userName }) => {
     const msg = { userName, message, timestamp: new Date().toISOString() };
-    if (rooms[roomId]) {
-      rooms[roomId].messages.push(msg);
-    }
-    // ✅ Fixed: broadcast to others only — sender adds message locally
+    if (rooms[roomId]) rooms[roomId].messages.push(msg);
     socket.to(roomId).emit('new-message', msg);
   });
 
-  // Disconnect
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
 
-    // Remove from any waiting lists
+    // Remove from waiting lists
     Object.keys(waiting).forEach(roomId => {
       if (waiting[roomId]) {
         waiting[roomId] = waiting[roomId].filter(u => u.socketId !== socket.id);
       }
     });
 
-    Object.keys(rooms).forEach(async (roomId) => {
-      if (rooms[roomId]) {
-        const userIndex = rooms[roomId].users.findIndex(u => u.socketId === socket.id);
-        if (userIndex !== -1) {
-          const user = rooms[roomId].users[userIndex];
-          rooms[roomId].users.splice(userIndex, 1);
+    // Remove from room
+    const roomId = socketRoomMap[socket.id];
+    delete socketRoomMap[socket.id];
 
-          socket.to(roomId).emit('user-disconnected', {
-            socketId: socket.id,
-            userName: user.userName
-          });
+    if (roomId && rooms[roomId]) {
+      const userIndex = rooms[roomId].users.findIndex(u => u.socketId === socket.id);
+      if (userIndex !== -1) {
+        const user = rooms[roomId].users[userIndex];
+        rooms[roomId].users.splice(userIndex, 1);
 
-          // If host left, assign new host or clean up
-          if (rooms[roomId].hostSocketId === socket.id) {
-            if (rooms[roomId].users.length > 0) {
-              rooms[roomId].hostSocketId = rooms[roomId].users[0].socketId;
-              io.to(rooms[roomId].hostSocketId).emit('you-are-host');
-            }
-          }
+        socket.to(roomId).emit('user-disconnected', {
+          socketId: socket.id,
+          userName: user.userName
+        });
 
-          // Clean up empty rooms
-          if (rooms[roomId].users.length === 0) {
-            delete rooms[roomId];
-            delete waiting[roomId];
-            try {
-              await Room.deleteOne({ roomId });
-            } catch (err) {
-              console.error('Error cleaning up room from DB:', err);
-            }
+        // Assign new host if host left
+        if (rooms[roomId].hostSocketId === socket.id) {
+          if (rooms[roomId].users.length > 0) {
+            rooms[roomId].hostSocketId = rooms[roomId].users[0].socketId;
+            io.to(rooms[roomId].hostSocketId).emit('you-are-host');
           }
         }
+
+        // Clean up empty room
+        if (rooms[roomId].users.length === 0) {
+          delete rooms[roomId];
+          delete waiting[roomId];
+          Room.deleteOne({ roomId }).catch(err =>
+            console.error('Error cleaning up room:', err)
+          );
+        }
       }
-    });
+    }
   });
 });
 
