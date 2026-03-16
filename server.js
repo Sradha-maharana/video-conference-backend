@@ -27,7 +27,8 @@ const io = socketio(server, {
 app.use(cors({
   origin: [
     "http://localhost:3000",
-    "https://video-conference-frontend.vercel.app"
+    "https://video-conference-frontend.vercel.app",
+    "https://*.vercel.app"
   ]
 }));
 
