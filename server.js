@@ -6,6 +6,9 @@ const http = require('http');
 const socketio = require('socket.io');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { GoogleGenAI } = require('@google/genai');
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const rateLimit = require('express-rate-limit');
 
 const app = express();
@@ -40,7 +43,14 @@ const userSchema = new mongoose.Schema({
   name: String,
   email: { type: String, unique: true },
   password: String,
-  createdAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
+  loginHistory: [{
+    ip: String,
+    userAgent: String,
+    timestamp: { type: Date, default: Date.now },
+    isAnomalous: Boolean,
+    riskScore: Number
+  }]
 });
 const User = mongoose.model('User', userSchema);
 
@@ -48,7 +58,10 @@ const roomSchema = new mongoose.Schema({
   roomId: String,
   host: String,
   participants: [String],
-  createdAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
+  status: { type: String, default: 'active' },
+  transcript: [{ userName: String, text: String, timestamp: Date }],
+  summary: String
 });
 const Room = mongoose.model('Room', roomSchema);
 
@@ -110,9 +123,85 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
 
+    // --- AI Anomaly Detection ---
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'] || 'Unknown';
+    const currentTime = new Date();
+    
+    let isAnomalous = false;
+    let riskScore = 0;
+
+    // Only check for anomalies if there is past history to compare against
+    if (user.loginHistory && user.loginHistory.length > 0) {
+      const recentHistory = user.loginHistory.slice(-5).map(h => ({
+        time: h.timestamp.toISOString(),
+        ip: h.ip,
+        agent: h.userAgent
+      }));
+
+      const prompt = `
+        You are a cybersecurity AI monitoring login patterns.
+        A user is attempting to log in. Here is their recent login history (last 5 successful logins):
+        ${JSON.stringify(recentHistory, null, 2)}
+        
+        Here is the current login attempt:
+        Time: ${currentTime.toISOString()}
+        IP Address: ${ip}
+        User Agent: ${userAgent}
+
+        Based purely on comparing the current attempt against the historical pattern (time of day, IP consistency, device consistency), calculate an anomaly risk score between 0.0 and 1.0 (where 1.0 is highly anomalous/risky and 0.0 is completely normal). 
+        Only return a valid JSON object with {"riskScore": number}. Do not return any other text or markdown formatting.
+      `;
+
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+        });
+        
+        // Clean markdown from response if present
+        let cleanedResponse = response.text.replace(/```json/g, '').replace(/```/g, '').trim();
+        const result = JSON.parse(cleanedResponse);
+        
+        if (result.riskScore !== undefined) {
+          riskScore = result.riskScore;
+          isAnomalous = riskScore > 0.7; // Threshold for anomaly
+          console.log(`[AI Anomaly Check] User: ${user.email} | Score: ${riskScore} | Anomalous: ${isAnomalous}`);
+        }
+      } catch (aiError) {
+        console.error("AI Anomaly Detection Error:", aiError);
+        // Fail open: don't block login if AI fails
+      }
+    }
+
+    // Save current login to history
+    user.loginHistory.push({
+      ip,
+      userAgent,
+      timestamp: currentTime,
+      isAnomalous,
+      riskScore
+    });
+    
+    // Keep history manageable (e.g., last 20 logins)
+    if (user.loginHistory.length > 20) {
+      user.loginHistory.shift(); 
+    }
+    
+    await user.save();
+    // ----------------------------
+
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { id: user._id, name: user.name, email: user.email } });
+    res.json({ 
+      token, 
+      user: { id: user._id, name: user.name, email: user.email },
+      securityAlert: isAnomalous ? {
+        message: "We detected an unusual login pattern from your account (new IP or strange time). For your security, please verify this was you.",
+        riskScore
+      } : null
+    });
   } catch (error) {
+    console.error("Login Error:", error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -139,6 +228,19 @@ app.get('/api/rooms/:roomId', verifyToken, async (req, res) => {
   }
 });
 
+app.get('/api/rooms-history', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const pastRooms = await Room.find({
+      $or: [{ host: userId }, { participants: userId }],
+      status: 'ended'
+    }).sort({ createdAt: -1 });
+    res.json(pastRooms);
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching history' });
+  }
+});
+
 // Track which room each socket is in: socketId -> roomId
 const socketRoomMap = {};
 const rooms = {};
@@ -158,7 +260,8 @@ io.on('connection', (socket) => {
       if (!rooms[roomId]) {
         rooms[roomId] = { 
           users: [], 
-          messages: [], 
+          messages: [],
+          transcripts: [],
           hostSocketId: null,
           hostUserId: roomDoc.host 
         };
@@ -181,6 +284,7 @@ io.on('connection', (socket) => {
           .map(u => ({ socketId: u.socketId, userId: u.userId, userName: u.userName }));
 
         socket.emit('join-approved');
+        socket.emit('you-are-host');
         socket.emit('existing-users', existingUsers);
         socket.emit('chat-history', rooms[roomId].messages);
         
@@ -236,6 +340,11 @@ io.on('connection', (socket) => {
     rooms[roomId].users.push({ socketId, userId: user.userId, userName: user.userName });
     socketRoomMap[socketId] = roomId;
 
+    Room.findOneAndUpdate(
+      { roomId },
+      { $addToSet: { participants: user.userId } }
+    ).catch(err => console.error("Error adding participant:", err));
+
     admittedSocket.emit('join-approved');
     admittedSocket.emit('existing-users', existingUsers);
     admittedSocket.emit('chat-history', rooms[roomId].messages);
@@ -274,6 +383,61 @@ io.on('connection', (socket) => {
     const msg = { userName, message, timestamp: new Date().toISOString() };
     if (rooms[roomId]) rooms[roomId].messages.push(msg);
     socket.to(roomId).emit('new-message', msg);
+  });
+
+  socket.on('send-transcript', ({ roomId, userName, text }) => {
+    const entry = { userName, text, timestamp: new Date() };
+    if (rooms[roomId]) {
+      rooms[roomId].transcripts.push(entry);
+      socket.to(roomId).emit('new-transcript', entry);
+    }
+  });
+
+  socket.on('end-meeting', async ({ roomId }) => {
+    if (!rooms[roomId] || rooms[roomId].hostSocketId !== socket.id) return;
+
+    const roomData = rooms[roomId];
+    const transcripts = roomData.transcripts || [];
+    
+    let summary = "No transcription available for this meeting.";
+    
+    if (transcripts.length > 0) {
+      const fullTranscriptText = transcripts
+        .map(t => `[${t.timestamp.toISOString()}] ${t.userName}: ${t.text}`)
+        .join('\n');
+        
+      try {
+        const prompt = `Please summarize the following meeting transcript. Provide a concise overview of the main topics discussed, key decisions made, and any action items.\n\nTranscript:\n${fullTranscriptText}`;
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+        });
+        summary = response.text || "Failed to generate summary.";
+      } catch (error) {
+        console.error("Gemini API Error:", error);
+        summary = "An error occurred while generating the summary.";
+      }
+    }
+
+    try {
+      await Room.findOneAndUpdate(
+        { roomId },
+        { 
+          status: 'ended',
+          transcript: transcripts,
+          summary: summary
+        }
+      );
+    } catch (dbError) {
+      console.error("Database update error:", dbError);
+    }
+
+    // Notify everyone the meeting ended
+    io.to(roomId).emit('meeting-ended', { summary });
+
+    // Clean up room in memory
+    delete rooms[roomId];
+    delete waiting[roomId];
   });
 
   socket.on('disconnect', () => {
